@@ -10,32 +10,26 @@ Tools:
 - search_speaking(query, k)       — keynote/transcript content only
 - search_all(query, k)            — everything
 - answer(question, max_passages)  — retrieval + structured answer payload
-                                    (no LLM call; returns top passages so
-                                    the caller's model can compose)
 
 Run:
   pip install -r requirements.txt
   python server.py
   # MCP at http://localhost:8080/mcp
-
-The included `data/chroma/` directory must hold the same Chroma collection
-(`lutz_author`) used locally. Use `scripts/export-rag.sh` to copy from
-~/Lutz_Media/rag-index/chroma into ./data/chroma.
+  # Health at http://localhost:8080/health
 """
 from __future__ import annotations
 
+import json
 import os
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any
 
 from chromadb import PersistentClient
 from chromadb.api.models.Collection import Collection
-from mcp.server import Server
-from mcp.server.streamable_http import StreamableHTTPSessionManager
-from mcp.types import TextContent, Tool
-import starlette.applications
-import starlette.routing
+from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 import uvicorn
 
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "./data/chroma")
@@ -43,6 +37,8 @@ COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "lutz_author")
 PORT = int(os.environ.get("PORT", "8080"))
 HOST = os.environ.get("HOST", "0.0.0.0")
 MAX_K = 12
+
+mcp = FastMCP("lutz-finger-rag", stateless_http=True)
 
 
 @dataclass
@@ -65,152 +61,6 @@ class Hit:
         }
 
 
-def _hits_from_query(col: Collection, query: str, k: int, source_filter: list[str] | None = None) -> list[Hit]:
-    k = max(1, min(MAX_K, k))
-    where = None
-    if source_filter:
-        where = {"source": {"$in": source_filter}} if len(source_filter) > 1 else {"source": source_filter[0]}
-    res = col.query(query_texts=[query], n_results=k, where=where)
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    dists = res.get("distances", [[]])[0]
-    out: list[Hit] = []
-    for doc, meta, dist in zip(docs, metas, dists):
-        meta = meta or {}
-        out.append(Hit(
-            text=doc or "",
-            title=meta.get("title") or "Untitled",
-            url=meta.get("url") or "",
-            date=meta.get("date") or "",
-            source=meta.get("source") or "",
-            score=1.0 - float(dist) if dist is not None else 0.0,
-        ))
-    return out
-
-
-def _format_hits(hits: list[Hit]) -> str:
-    """Plain-text representation that LLM clients render readably."""
-    lines = []
-    for i, h in enumerate(hits, 1):
-        lines.append(f"### {i}. {h.title}")
-        if h.url:
-            lines.append(f"Source: {h.source or 'unknown'} — {h.url}")
-        if h.date:
-            lines.append(f"Date: {h.date}")
-        lines.append("")
-        lines.append(h.text[:800])
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-    return "\n".join(lines).rstrip()
-
-
-# ── MCP server setup ────────────────────────────────────────────────────────
-
-app = Server("lutz-finger-rag")
-
-
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="search_writing",
-            description=(
-                "Search Lutz Finger's writing (Forbes column + LinkedIn articles + LinkedIn posts). "
-                "Returns top passages with title, source URL, date, and excerpt. "
-                "Use this to find what Lutz has written about a topic."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to search for, in natural language."},
-                    "k": {"type": "integer", "description": f"How many results (1-{MAX_K}). Default 5.", "default": 5},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="search_speaking",
-            description=(
-                "Search Lutz Finger's keynote and lecture content (transcripts, slides). "
-                "Use this for what he has said on stage rather than written."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "k": {"type": "integer", "default": 5},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="search_all",
-            description=(
-                "Search across everything Lutz Finger has authored — writing, speaking, "
-                "book excerpts, course material."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "k": {"type": "integer", "default": 5},
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="answer",
-            description=(
-                "Retrieve the most relevant passages for a question. Returns structured "
-                "JSON with the top passages and sources — designed for the caller's LLM "
-                "to compose a final answer. Does NOT itself call an LLM."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string"},
-                    "max_passages": {"type": "integer", "default": 4},
-                },
-                "required": ["question"],
-            },
-        ),
-    ]
-
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    col = _collection()
-    if name == "search_writing":
-        hits = _hits_from_query(col, arguments["query"], arguments.get("k", 5),
-                                source_filter=["Forbes", "LinkedIn"])
-        return [TextContent(type="text", text=_format_hits(hits))]
-    if name == "search_speaking":
-        hits = _hits_from_query(col, arguments["query"], arguments.get("k", 5),
-                                source_filter=["Keynote", "Course", "course"])
-        if not hits:
-            hits = _hits_from_query(col, arguments["query"], arguments.get("k", 5))
-        return [TextContent(type="text", text=_format_hits(hits))]
-    if name == "search_all":
-        hits = _hits_from_query(col, arguments["query"], arguments.get("k", 5))
-        return [TextContent(type="text", text=_format_hits(hits))]
-    if name == "answer":
-        hits = _hits_from_query(col, arguments["question"], arguments.get("max_passages", 4))
-        payload = {
-            "question": arguments["question"],
-            "passages": [h.to_dict() for h in hits],
-            "note": (
-                "These are the most relevant passages from Lutz Finger's authored "
-                "content. Compose your answer grounded in these sources and cite each."
-            ),
-        }
-        import json
-        return [TextContent(type="text", text=json.dumps(payload, indent=2))]
-    raise ValueError(f"Unknown tool: {name}")
-
-
-# ── Resource: lazy-loaded ChromaDB collection ───────────────────────────────
-
 _client: PersistentClient | None = None
 _collection_cache: Collection | None = None
 
@@ -223,19 +73,89 @@ def _collection() -> Collection:
     return _collection_cache
 
 
-# ── HTTP transport with health probe ────────────────────────────────────────
+def _query(query: str, k: int, source_filter: list[str] | None = None) -> list[Hit]:
+    k = max(1, min(MAX_K, k))
+    where = None
+    if source_filter:
+        where = {"source": {"$in": source_filter}} if len(source_filter) > 1 else {"source": source_filter[0]}
+    res = _collection().query(query_texts=[query], n_results=k, where=where)
+    docs = res.get("documents", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
+    dists = res.get("distances", [[]])[0]
+    hits: list[Hit] = []
+    for doc, meta, dist in zip(docs, metas, dists):
+        meta = meta or {}
+        hits.append(Hit(
+            text=doc or "",
+            title=meta.get("title") or "Untitled",
+            url=meta.get("url") or "",
+            date=meta.get("date") or "",
+            source=meta.get("source") or "",
+            score=1.0 - float(dist) if dist is not None else 0.0,
+        ))
+    return hits
 
-session_manager = StreamableHTTPSessionManager(app=app, stateless=True)
+
+def _format_hits(hits: list[Hit]) -> str:
+    if not hits:
+        return "_No matching passages found._"
+    parts = []
+    for i, h in enumerate(hits, 1):
+        parts.append(f"### {i}. {h.title}")
+        if h.url:
+            parts.append(f"Source: {h.source or 'unknown'} — {h.url}")
+        if h.date:
+            parts.append(f"Date: {h.date}")
+        parts.append("")
+        parts.append(h.text[:800])
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+    return "\n".join(parts).rstrip()
 
 
-@asynccontextmanager
-async def lifespan(app: starlette.applications.Starlette) -> AsyncIterator[None]:
-    async with session_manager.run():
-        yield
+# ── Tools ──────────────────────────────────────────────────────────────────
 
+@mcp.tool()
+def search_writing(query: str, k: int = 5) -> str:
+    """Search Lutz Finger's writing (Forbes column, LinkedIn articles, LinkedIn posts).
+    Returns top passages with title, source URL, date, and excerpt."""
+    return _format_hits(_query(query, k, source_filter=["Forbes", "LinkedIn"]))
+
+
+@mcp.tool()
+def search_speaking(query: str, k: int = 5) -> str:
+    """Search Lutz Finger's keynote and course content (transcripts, slides)."""
+    hits = _query(query, k, source_filter=["Keynote", "Course", "course"])
+    if not hits:
+        hits = _query(query, k)
+    return _format_hits(hits)
+
+
+@mcp.tool()
+def search_all(query: str, k: int = 5) -> str:
+    """Search across everything Lutz Finger has authored — writing, speaking,
+    book excerpts, course material."""
+    return _format_hits(_query(query, k))
+
+
+@mcp.tool()
+def answer(question: str, max_passages: int = 4) -> str:
+    """Retrieve the most relevant passages for a question. Returns structured JSON
+    with the top passages and sources — designed for the caller's LLM to compose
+    a final answer with citations."""
+    hits = _query(question, max_passages)
+    payload = {
+        "question": question,
+        "passages": [h.to_dict() for h in hits],
+        "note": "Passages from Lutz Finger's authored content. Compose grounded in these and cite each.",
+    }
+    return json.dumps(payload, indent=2)
+
+
+# ── HTTP app ────────────────────────────────────────────────────────────────
 
 async def health(request):
-    from starlette.responses import JSONResponse
     try:
         c = _collection().count()
     except Exception as e:
@@ -248,20 +168,15 @@ async def health(request):
     })
 
 
-async def handle_mcp(scope, receive, send):
-    await session_manager.handle_request(scope, receive, send)
-
-
-starlette_app = starlette.applications.Starlette(
-    debug=False,
-    routes=[
-        starlette.routing.Route("/", health),
-        starlette.routing.Route("/health", health),
-        starlette.routing.Mount("/mcp", app=handle_mcp),
-    ],
-    lifespan=lifespan,
-)
+def build_app() -> Starlette:
+    # FastMCP's streamable_http_app already mounts /mcp and owns its own
+    # lifespan. We extend it with health endpoints rather than wrapping it,
+    # so the lifespan context (session manager startup/shutdown) stays intact.
+    mcp_app = mcp.streamable_http_app()
+    mcp_app.routes.insert(0, Route("/", health))
+    mcp_app.routes.insert(1, Route("/health", health))
+    return mcp_app
 
 
 if __name__ == "__main__":
-    uvicorn.run(starlette_app, host=HOST, port=PORT)
+    uvicorn.run(build_app(), host=HOST, port=PORT)
