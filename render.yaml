@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: lutz-finger-rag-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: CHROMA_PATH
+        value: /app/data/chroma
+      - key: COLLECTION_NAME
+        value: lutz_author

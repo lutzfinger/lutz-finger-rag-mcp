@@ -1,0 +1,5 @@
+# data/ — committed below since Render builds Docker from the repo
+__pycache__/
+.venv/
+.env
+.DS_Store
